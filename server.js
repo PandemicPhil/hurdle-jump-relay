@@ -7,8 +7,10 @@
 // Protocol (JSON text frames):
 //   client -> server: {op:"create", room, info} | {op:"join", room, info} | {op:"send", data}
 //                     {op:"lock"} (host: no more joins) | {op:"unlock"} | {op:"leave"}
+//                     {op:"kick", id} (host: remove a player, e.g. one who stopped responding)
 //   server -> client: {op:"joined", id, host, players:[{id, info}]} | {op:"peer_joined", id, info}
 //                     {op:"peer_left", id} | {op:"msg", from, data} | {op:"closed"} | {op:"error", msg}
+//                     {op:"kicked"} (you were removed by the host)
 //
 // Deploy: any Node 18+ host. Start command: `node server.js` (listens on $PORT, default 8080).
 const http = require("http");
@@ -98,6 +100,15 @@ wss.on("connection", (ws) => {
       case "leave":
         leave(ws);
         break;
+      case "kick": {
+        // Host only: remove another player even if their game has frozen, freeing the spot.
+        if (!room || ws.id !== room.host || m.id === room.host) return;
+        const target = room.players.get(Number(m.id));
+        if (!target) return;
+        send(target.ws, { op: "kicked" });
+        leave(target.ws);
+        break;
+      }
     }
   });
   ws.on("close", () => leave(ws));

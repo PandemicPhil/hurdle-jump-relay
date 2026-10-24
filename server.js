@@ -20,8 +20,10 @@
 //   GET  /leaderboard?id=<id>            -> {top: [{rank, ref, name, score, runner, champ}], you: {rank, score, ref, name} | null, total}
 //   POST /leaderboard        {id, num, score, runner, champ} -> the board (as GET) - your best run
 //   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
-//   POST /leaderboard/report {id, ref}   -> {ok}. REPORTS_TO_HIDE different players = name hidden
-//   GET  /admin?key=<ADMIN_KEY>&action=clear|remove&ref=<ref>  (you only: clear a name / delete an entry)
+//   POST /leaderboard/report {id, ref}   -> {ok}. Reports never hide anything by themselves (no trolling):
+//                                           they go on a list for the admin to review.
+//   GET  /admin?key=<ADMIN_KEY>          (you only) a page listing reported names and the top 50, with
+//                                           buttons to clear a name, remove an entry or dismiss reports
 // Names: 3-12 letters, numbers and single spaces, checked against a profanity filter (the "obscenity"
 // package) and a reserved list. No name = "Player <number>".
 // Storage: an Upstash Redis database when UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set
@@ -100,7 +102,6 @@ function checkName(raw) {
 
 const RUNNERS = ["Tim", "Jim", "Jen", "Lyn"];
 const TOP_N = 50;
-const REPORTS_TO_HIDE = 3;
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -128,7 +129,8 @@ function parseMeta(json) {
 const board = UPSTASH_URL && UPSTASH_TOKEN
   ? {
       // hj:scores = sorted set of best runs (only ever raised: GT), hj:meta = id -> details (JSON),
-      // hj:refs = ref -> id, hj:rep:<id> = set of players who reported that name.
+      // hj:refs = ref -> id, hj:rep:<id> = set of players who reported that name (one report each),
+      // hj:reported = reported ids by number of reports (the admin's list).
       async meta(id) { return parseMeta(await redis(["HGET", "hj:meta", id])); },
       async saveMeta(id, m) {
         await redis(["HSET", "hj:meta", id, JSON.stringify(m)]);
@@ -143,20 +145,31 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       async setName(id, name) {
         const m = await this.meta(id);
         await this.saveMeta(id, { ...m, name });
-        await redis(["DEL", "hj:rep:" + id]);   // a new name starts with no reports
+        await this.clearReports(id);   // a new name starts with no reports
       },
       async report(reporter, ref) {
         const target = await this.idOf(ref);
         if (!target || target === reporter) return;
         await redis(["SADD", "hj:rep:" + target, reporter]);
-        if (Number(await redis(["SCARD", "hj:rep:" + target])) >= REPORTS_TO_HIDE) await this.clearName(ref);
+        const n = Number(await redis(["SCARD", "hj:rep:" + target]));
+        await redis(["ZADD", "hj:reported", String(n), target]);
+      },
+      async clearReports(id) {
+        await redis(["DEL", "hj:rep:" + id]);
+        await redis(["ZREM", "hj:reported", id]);
+      },
+      async dismiss(ref) {
+        const id = await this.idOf(ref);
+        if (!id) return false;
+        await this.clearReports(id);
+        return true;
       },
       async clearName(ref) {
         const id = await this.idOf(ref);
         if (!id) return false;
         const m = await this.meta(id);
         await this.saveMeta(id, { ...m, name: "" });
-        await redis(["DEL", "hj:rep:" + id]);
+        await this.clearReports(id);
         return true;
       },
       async remove(ref) {
@@ -164,8 +177,19 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         if (!id) return false;
         await redis(["ZREM", "hj:scores", id]);
         await redis(["HDEL", "hj:meta", id]);
-        await redis(["DEL", "hj:rep:" + id]);
+        await this.clearReports(id);
         return true;
+      },
+      // The admin's list: reported entries, most reports first.
+      async reported() {
+        const flat = await redis(["ZREVRANGE", "hj:reported", "0", "49", "WITHSCORES"]);
+        const out = [];
+        for (let i = 0; i < flat.length; i += 2) {
+          const id = flat[i];
+          const score = await redis(["ZSCORE", "hj:scores", id]);
+          out.push({ ...entryOut(0, id, score === null ? 0 : Number(score), await this.meta(id)), reports: Number(flat[i + 1]) });
+        }
+        return out;
       },
       async view(id) {
         const flat = await redis(["ZREVRANGE", "hj:scores", "0", String(TOP_N - 1), "WITHSCORES"]);
@@ -206,7 +230,17 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
           const set = reports.get(target) || new Set();
           set.add(reporter);
           reports.set(target, set);
-          if (set.size >= REPORTS_TO_HIDE) await this.clearName(ref);
+        },
+        async dismiss(ref) {
+          const id = idOf(ref);
+          if (!id) return false;
+          reports.delete(id);
+          return true;
+        },
+        async reported() {
+          return [...reports.entries()].filter(([id, s]) => s.size > 0 && mem.has(id))
+            .sort((a, b) => b[1].size - a[1].size)
+            .map(([id, s]) => ({ ...entryOut(0, id, Math.max(0, mem.get(id).score), mem.get(id)), reports: s.size }));
         },
         async clearName(ref) {
           const id = idOf(ref);
@@ -267,6 +301,38 @@ function rateLimited(ip) {
 }
 setInterval(() => posts.clear(), 10 * 60000);
 
+// ---------------------------------------------------------------- admin page
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function adminPage(key, reported, top, msg) {
+  const link = (action, ref, label, confirmText) =>
+    `<a class="b ${action}" href="/admin?key=${encodeURIComponent(key)}&action=${action}&ref=${ref}"` +
+    (confirmText ? ` onclick="return confirm('${confirmText}')"` : "") + `>${label}</a>`;
+  const row = (e, withReports) => `<tr><td>${esc(e.name)}${e.custom ? "" : " <i>(no custom name)</i>"}</td>` +
+    (withReports ? `<td>${e.reports}</td>` : `<td>#${e.rank}</td>`) + `<td>${e.score}</td><td class="acts">` +
+    (e.custom ? link("clear", e.ref, "Clear name") : "") +
+    link("remove", e.ref, "Remove entry", "Delete this entry and its score?") +
+    (withReports ? link("dismiss", e.ref, "Dismiss reports") : "") + `</td></tr>`;
+  const notes = { clear: "Name cleared.", remove: "Entry removed.", dismiss: "Reports dismissed.", "not-found": "That entry no longer exists." };
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Hurdle Jump admin</title><style>
+body{font-family:system-ui,sans-serif;margin:16px;background:#1e2a44;color:#fff}h1{color:#ffd23a;font-size:22px}
+h2{font-size:17px;margin-top:22px;color:#bfe3ff}table{border-collapse:collapse;width:100%}td,th{padding:8px 6px;border-bottom:1px solid #34405e;text-align:left;font-size:15px}
+.acts{white-space:nowrap}.b{display:inline-block;margin:2px;padding:7px 10px;border-radius:8px;color:#fff;text-decoration:none;font-size:13px}
+.clear{background:#3a86f0}.remove{background:#e8403a}.dismiss{background:#5a6070}.msg{background:#4cc94c;padding:8px 12px;border-radius:8px;display:inline-block}
+i{color:#9aa4b8}</style></head><body><h1>Hurdle Jump leaderboard admin</h1>
+${msg ? `<p class="msg">${esc(notes[msg] || msg)}</p>` : ""}
+<h2>Reported names (${reported.length})</h2>
+${reported.length ? `<table><tr><th>Name</th><th>Reports</th><th>Best</th><th></th></tr>${reported.map((e) => row(e, true)).join("")}</table>` : "<p>Nothing reported.</p>"}
+<h2>Top ${top.length}</h2>
+${top.length ? `<table><tr><th>Name</th><th>Rank</th><th>Best</th><th></th></tr>${top.map((e) => row(e, false)).join("")}</table>` : "<p>No scores yet.</p>"}
+<p><i>Clear name = back to "Player ####". Remove entry = deletes the score (e.g. a faked one). Dismiss reports = the name is fine.</i></p>
+</body></html>`;
+}
+
 // ---------------------------------------------------------------- web requests
 
 const CORS = {
@@ -324,16 +390,23 @@ const server = http.createServer(async (req, res) => {
       }
     }
     if (url.pathname === "/admin") {
-      // You only: /admin?key=<ADMIN_KEY>&action=clear&ref=<ref> (name back to "Player ####")
-      //       or  /admin?key=<ADMIN_KEY>&action=remove&ref=<ref> (delete the entry).
-      // Find an entry's ref by opening /leaderboard in a browser. Off unless ADMIN_KEY is set.
-      if (!ADMIN_KEY || url.searchParams.get("key") !== ADMIN_KEY) return reply(res, 403, { error: "not allowed" });
-      const ref = String(url.searchParams.get("ref") || "");
+      // You only (ADMIN_KEY on Render): a page with reported names and the top 50, each with buttons
+      // to clear the name (back to "Player ####"), remove the entry, or dismiss its reports.
+      // Off unless ADMIN_KEY is set.
+      const key = url.searchParams.get("key") || "";
+      if (!ADMIN_KEY || key !== ADMIN_KEY) return reply(res, 403, { error: "not allowed" });
       const action = url.searchParams.get("action");
-      const done = action === "clear" ? await board.clearName(ref) : action === "remove" ? await board.remove(ref) : false;
-      return reply(res, 200, { ok: done });
-    }
-  } catch (err) {
+      if (action) {
+        const ref = String(url.searchParams.get("ref") || "");
+        const done = action === "clear" ? await board.clearName(ref)
+          : action === "remove" ? await board.remove(ref)
+          : action === "dismiss" ? await board.dismiss(ref) : false;
+        res.writeHead(303, { Location: "/admin?key=" + encodeURIComponent(key) + "&msg=" + (done ? action : "not-found") });
+        return res.end();
+      }
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(adminPage(key, await board.reported(), (await board.view("")).top, url.searchParams.get("msg") || ""));
+    }  } catch (err) {
     console.error("leaderboard:", err.message);
     return reply(res, 500, { error: "The leaderboard isn't available right now" });
   }  res.writeHead(200, { "Content-Type": "text/plain", ...CORS });

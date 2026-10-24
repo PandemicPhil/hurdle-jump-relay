@@ -1,28 +1,347 @@
-// Hurdle Jump multiplayer relay ("matchmaker").
+// Hurdle Jump multiplayer relay ("matchmaker") + global leaderboard.
 //
-// Players connect over WebSocket. A host CREATES a race with a name; up to 3 more players JOIN it
-// with the same name. After that the server just forwards each player's small messages to the
-// others in the same race. It never runs the game itself.
+// MULTIPLAYER. Players connect over WebSocket. Private race: a host CREATES a race with a name and
+// up to 3 more players JOIN it with the same name. Public race: QUICK puts you in any open public
+// lobby (or makes you the host of a new one). Empty spots are filled with CPU runners by the game
+// itself; the server only forwards each player's small messages to the others in the same race.
 //
-// Protocol (JSON text frames):
-//   client -> server: {op:"create", room, info} | {op:"join", room, info} | {op:"send", data}
-//                     {op:"lock"} (host: no more joins) | {op:"unlock"} | {op:"leave"}
+// Protocol (JSON text frames). "v" = the game's multiplayer version: players only race the same v.
+//   client -> server: {op:"create", room, info, v} | {op:"join", room, info, v} | {op:"quick", info, v}
+//                     {op:"send", data} | {op:"lock"} (host: no more joins) | {op:"unlock"} | {op:"leave"}
 //                     {op:"kick", id} (host: remove a player, e.g. one who stopped responding)
-//   server -> client: {op:"joined", id, host, players:[{id, info}]} | {op:"peer_joined", id, info}
-//                     {op:"peer_left", id} | {op:"msg", from, data} | {op:"closed"} | {op:"error", msg}
+//   server -> client: {op:"joined", id, host, room, public, players:[{id, info}]} | {op:"peer_joined", id, info}
+//                     {op:"peer_left", id} | {op:"host", id} (public race: the host left, this is the new one)
+//                     {op:"msg", from, data} | {op:"closed"} (private race: the host left) | {op:"error", msg}
 //                     {op:"kicked"} (you were removed by the host)
+//
+// LEADERBOARD (plain web requests, so it also works from the browser build). A player's "id" is a
+// private random key their game made; "ref" is a public tag for an entry (a hash of the id) used to
+// report it, so ids are never shown to anyone else.
+//   GET  /leaderboard?id=<id>            -> {top: [{rank, ref, name, score, runner, champ}], you: {rank, score, ref, name} | null, total}
+//   POST /leaderboard        {id, num, score, runner, champ} -> the board (as GET) - your best run
+//   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
+//   POST /leaderboard/report {id, ref}   -> {ok}. REPORTS_TO_HIDE different players = name hidden
+//   GET  /admin?key=<ADMIN_KEY>&action=clear|remove&ref=<ref>  (you only: clear a name / delete an entry)
+// Names: 3-12 letters, numbers and single spaces, checked against a profanity filter (the "obscenity"
+// package) and a reserved list. No name = "Player <number>".
+// Storage: an Upstash Redis database when UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set
+// (see MULTIPLAYER_SETUP.md); otherwise memory only, which is wiped whenever the server restarts.
 //
 // Deploy: any Node 18+ host. Start command: `node server.js` (listens on $PORT, default 8080).
 const http = require("http");
+const crypto = require("crypto");
 const { WebSocketServer } = require("ws");
 
 const MAX_PLAYERS = 4;
-const rooms = new Map(); // NAME -> {host, locked, players: Map(id -> {ws, info})}
+const rooms = new Map(); // NAME -> {host, locked, public, v, players: Map(id -> {ws, info})}
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { "Content-Type": "text/plain" });
+// ---------------------------------------------------------------- names
+
+// The profanity filter: the "obscenity" package, plus extra rules for spellings it misses and an
+// allow-list for innocent words it trips on. If the package is missing for some reason, a small
+// built-in list stands in so the server keeps running.
+
+// Lower case, look-alike digits turned into letters ("sh1t" -> "shit").
+function normalize(s) {
+  return s.toLowerCase().replace(/0/g, "o").replace(/1/g, "i").replace(/3/g, "e").replace(/4/g, "a")
+    .replace(/5/g, "s").replace(/7/g, "t").replace(/8/g, "b");
+}
+
+// Extra rules, checked on the normalized name (with and without its spaces). \b ("word edge") keeps
+// innocent words safe, e.g. "grape", "Sussex", "Dickens", "Peacock".
+const EXTRA = [/ph+u+c*k/, /\bf+u+c*k+/, /\bk+u+n+t/, /butt ?hole/, /butt ?plug/, /\bnazi/, /hitler/, /\bkkk\b/,
+  /\brap(e|ist)\b/, /\bporn/, /\bcum\b/, /\banus\b/, /\btits?\b/, /\bboobs?\b/, /\bjizz/, /\bdildo/, /\bwhore/,
+  /\bslut/, /\bhoe\b/, /\bpiss/, /\bwank/, /\btwat/, /\bpussy/, /\bdick\b/, /\bcock\b/, /\bfag/];
+function extraBad(s) {
+  const n = normalize(s);
+  return EXTRA.some((r) => r.test(n) || r.test(n.replace(/ /g, "")));
+}
+
+// Innocent words a filter can trip on (taken out before checking).
+const ALLOWED = ["shiitake"];
+function withoutAllowed(s) {
+  let out = s;
+  for (const w of ALLOWED) out = out.replace(new RegExp(w, "ig"), " ");
+  return out;
+}
+
+let packageBad;
+try {
+  const { RegExpMatcher, englishDataset, englishRecommendedTransformers } = require("obscenity");
+  const matcher = new RegExpMatcher({ ...englishDataset.build(), ...englishRecommendedTransformers });
+  packageBad = (s) => matcher.hasMatch(s);
+} catch (err) {
+  console.log("Name filter: the 'obscenity' package isn't installed - using a small built-in list.");
+  const words = ["fuck", "shit", "cunt", "bitch", "nigg", "faggot", "pussy", "slut", "whore", "nazi", "penis", "vagina", "porn", "twat", "wank", "asshole"];
+  packageBad = (s) => {
+    const flat = normalize(s).replace(/[^a-z]/g, "");
+    return words.some((w) => flat.includes(w));
+  };
+}
+
+function isProfane(s) {
+  const t = withoutAllowed(s);
+  return packageBad(t) || extraBad(t);
+}
+// Names the game uses itself, or that could pass for staff.
+const RESERVED = /^(cpu|admin|administrator|mod|moderator|staff|dev|developer|owner|official|support|player ?\d*|hurdle ?jump|rex|dash|bolt|you)$/i;
+
+// Returns [cleanName, null] or [null, reason].
+function checkName(raw) {
+  const name = String(raw || "").trim().replace(/\s+/g, " ");
+  if (name.length < 3 || name.length > 12) return [null, "Names are 3 to 12 characters long"];
+  if (!/^[A-Za-z0-9]+( [A-Za-z0-9]+)*$/.test(name)) return [null, "Use only letters, numbers and spaces"];
+  if (RESERVED.test(name)) return [null, "That name is reserved - try another"];
+  if (isProfane(name) || isProfane(name.replace(/ /g, ""))) return [null, "That name isn't allowed"];
+  return [name, null];
+}
+
+// ---------------------------------------------------------------- leaderboard storage
+
+const RUNNERS = ["Tim", "Jim", "Jen", "Lyn"];
+const TOP_N = 50;
+const REPORTS_TO_HIDE = 3;
+const ADMIN_KEY = process.env.ADMIN_KEY || "";
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+
+// Public tag for an entry: the start of a hash of the private id (same formula in tools/relay_server.gd).
+function refOf(id) {
+  return crypto.createHash("sha256").update("hj:" + id).digest("hex").slice(0, 12);
+}
+
+async function redis(cmd) {
+  const r = await fetch(UPSTASH_URL, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + UPSTASH_TOKEN },
+    body: JSON.stringify(cmd),
+  });
+  const j = await r.json();
+  if (j.error) throw new Error(j.error);
+  return j.result;
+}
+
+function parseMeta(json) {
+  try { return JSON.parse(json || "{}") || {}; } catch { return {}; }
+}
+
+const board = UPSTASH_URL && UPSTASH_TOKEN
+  ? {
+      // hj:scores = sorted set of best runs (only ever raised: GT), hj:meta = id -> details (JSON),
+      // hj:refs = ref -> id, hj:rep:<id> = set of players who reported that name.
+      async meta(id) { return parseMeta(await redis(["HGET", "hj:meta", id])); },
+      async saveMeta(id, m) {
+        await redis(["HSET", "hj:meta", id, JSON.stringify(m)]);
+        await redis(["HSET", "hj:refs", refOf(id), id]);
+      },
+      async idOf(ref) { return await redis(["HGET", "hj:refs", ref]); },
+      async submit(e) {
+        await redis(["ZADD", "hj:scores", "GT", String(e.score), e.id]);
+        const m = await this.meta(e.id);
+        await this.saveMeta(e.id, { ...m, num: e.num, runner: e.runner, champ: e.champ });
+      },
+      async setName(id, name) {
+        const m = await this.meta(id);
+        await this.saveMeta(id, { ...m, name });
+        await redis(["DEL", "hj:rep:" + id]);   // a new name starts with no reports
+      },
+      async report(reporter, ref) {
+        const target = await this.idOf(ref);
+        if (!target || target === reporter) return;
+        await redis(["SADD", "hj:rep:" + target, reporter]);
+        if (Number(await redis(["SCARD", "hj:rep:" + target])) >= REPORTS_TO_HIDE) await this.clearName(ref);
+      },
+      async clearName(ref) {
+        const id = await this.idOf(ref);
+        if (!id) return false;
+        const m = await this.meta(id);
+        await this.saveMeta(id, { ...m, name: "" });
+        await redis(["DEL", "hj:rep:" + id]);
+        return true;
+      },
+      async remove(ref) {
+        const id = await this.idOf(ref);
+        if (!id) return false;
+        await redis(["ZREM", "hj:scores", id]);
+        await redis(["HDEL", "hj:meta", id]);
+        await redis(["DEL", "hj:rep:" + id]);
+        return true;
+      },
+      async view(id) {
+        const flat = await redis(["ZREVRANGE", "hj:scores", "0", String(TOP_N - 1), "WITHSCORES"]);
+        const ids = [];
+        const scores = [];
+        for (let i = 0; i < flat.length; i += 2) { ids.push(flat[i]); scores.push(Number(flat[i + 1])); }
+        const metas = ids.length ? await redis(["HMGET", "hj:meta", ...ids]) : [];
+        const top = ids.map((pid, i) => entryOut(i + 1, pid, scores[i], parseMeta(metas[i])));
+        let you = null;
+        if (id) {
+          const rank = await redis(["ZREVRANK", "hj:scores", id]);
+          const score = await redis(["ZSCORE", "hj:scores", id]);
+          const mine = entryOut(0, id, 0, await this.meta(id));
+          you = { rank: rank === null ? 0 : Number(rank) + 1, score: score === null ? 0 : Number(score), ref: mine.ref, name: mine.name };
+          if (rank === null && !mine.custom) you = null;
+        }
+        const total = Number(await redis(["ZCARD", "hj:scores"]));
+        return { top, you, total };
+      },
+    }
+  : (() => {
+      console.log("Leaderboard: no UPSTASH_REDIS_REST_URL / _TOKEN set - keeping scores in memory (lost on restart).");
+      const mem = new Map();     // id -> {score (-1 = no run yet), num, runner, champ, name}
+      const reports = new Map(); // id -> Set(reporters)
+      const idOf = (ref) => [...mem.keys()].find((id) => refOf(id) === ref);
+      return {
+        async submit(e) {
+          const old = mem.get(e.id) || { score: -1 };
+          mem.set(e.id, { ...old, score: Math.max(e.score, old.score), num: e.num, runner: e.runner, champ: e.champ });
+        },
+        async setName(id, name) {
+          mem.set(id, { score: -1, ...(mem.get(id) || {}), name });
+          reports.delete(id);
+        },
+        async report(reporter, ref) {
+          const target = idOf(ref);
+          if (!target || target === reporter) return;
+          const set = reports.get(target) || new Set();
+          set.add(reporter);
+          reports.set(target, set);
+          if (set.size >= REPORTS_TO_HIDE) await this.clearName(ref);
+        },
+        async clearName(ref) {
+          const id = idOf(ref);
+          if (!id) return false;
+          mem.get(id).name = "";
+          reports.delete(id);
+          return true;
+        },
+        async remove(ref) {
+          const id = idOf(ref);
+          if (!id) return false;
+          mem.delete(id);
+          reports.delete(id);
+          return true;
+        },
+        async view(id) {
+          const all = [...mem.entries()].filter(([, m]) => m.score >= 0).sort((a, b) => b[1].score - a[1].score);
+          const top = all.slice(0, TOP_N).map(([pid, m], i) => entryOut(i + 1, pid, m.score, m));
+          let you = null;
+          if (id && mem.has(id)) {
+            const at = all.findIndex(([pid]) => pid === id);
+            const mine = entryOut(0, id, 0, mem.get(id));
+            you = { rank: at + 1, score: at >= 0 ? all[at][1].score : 0, ref: mine.ref, name: mine.name };
+          }
+          return { top, you, total: all.length };
+        },
+      };
+    })();
+
+function entryOut(rank, id, score, m) {
+  const num = Number.isInteger(m.num) ? m.num : 0;
+  const custom = typeof m.name === "string" && m.name !== "";
+  return { rank, ref: refOf(id), name: custom ? m.name : "Player " + num, custom, score,
+    runner: RUNNERS.includes(m.runner) ? m.runner : "", champ: m.champ === true };
+}
+
+function validId(id) {
+  return /^[0-9a-f]{16,40}$/.test(String(id || ""));
+}
+
+function validEntry(b) {
+  if (!b || typeof b !== "object" || !validId(b.id)) return null;
+  const num = Number(b.num), score = Number(b.score);
+  if (!Number.isInteger(num) || num < 1000 || num > 9999) return null;
+  if (!Number.isInteger(score) || score < 0 || score > 5000) return null;
+  const runner = RUNNERS.includes(b.runner) ? b.runner : "";
+  return { id: String(b.id), num, score, runner, champ: b.champ === true };
+}
+
+// Each address may send a handful of requests a minute (a run takes far longer than that).
+const posts = new Map(); // ip -> [timestamps]
+function rateLimited(ip) {
+  const now = Date.now();
+  const list = (posts.get(ip) || []).filter((t) => now - t < 60000);
+  list.push(now);
+  posts.set(ip, list);
+  return list.length > 12;
+}
+setInterval(() => posts.clear(), 10 * 60000);
+
+// ---------------------------------------------------------------- web requests
+
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function reply(res, code, obj) {
+  res.writeHead(code, { "Content-Type": "application/json", ...CORS });
+  res.end(JSON.stringify(obj));
+}
+
+async function readBody(req) {
+  let body = "";
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 2048) return null;
+  }
+  try { return JSON.parse(body); } catch { return null; }
+}
+
+const server = http.createServer(async (req, res) => {
+  const url = new URL(req.url, "http://relay");
+  if (req.method === "OPTIONS") {
+    res.writeHead(204, CORS);
+    return res.end();
+  }
+  try {
+    if (url.pathname === "/leaderboard" && req.method === "GET") {
+      return reply(res, 200, await board.view(url.searchParams.get("id") || ""));
+    }
+    if (url.pathname.startsWith("/leaderboard") && req.method === "POST") {
+      // The address the host's proxy saw (it adds it LAST - earlier entries can be faked by the sender).
+      const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",").pop().trim();
+      if (rateLimited(ip)) return reply(res, 429, { error: "Too many tries - wait a minute" });
+      const b = await readBody(req);
+      if (url.pathname === "/leaderboard") {
+        const e = validEntry(b);
+        if (!e) return reply(res, 400, { error: "bad entry" });
+        await board.submit(e);
+        return reply(res, 200, await board.view(e.id));
+      }
+      if (url.pathname === "/leaderboard/name") {
+        if (!b || !validId(b.id)) return reply(res, 400, { error: "bad request" });
+        const [name, why] = checkName(b.name);
+        if (!name) return reply(res, 200, { error: why });
+        await board.setName(String(b.id), name);
+        return reply(res, 200, await board.view(String(b.id)));
+      }
+      if (url.pathname === "/leaderboard/report") {
+        if (!b || !validId(b.id) || !/^[0-9a-f]{12}$/.test(String(b.ref || ""))) return reply(res, 400, { error: "bad request" });
+        await board.report(String(b.id), String(b.ref));
+        return reply(res, 200, { ok: true });
+      }
+    }
+    if (url.pathname === "/admin") {
+      // You only: /admin?key=<ADMIN_KEY>&action=clear&ref=<ref> (name back to "Player ####")
+      //       or  /admin?key=<ADMIN_KEY>&action=remove&ref=<ref> (delete the entry).
+      // Find an entry's ref by opening /leaderboard in a browser. Off unless ADMIN_KEY is set.
+      if (!ADMIN_KEY || url.searchParams.get("key") !== ADMIN_KEY) return reply(res, 403, { error: "not allowed" });
+      const ref = String(url.searchParams.get("ref") || "");
+      const action = url.searchParams.get("action");
+      const done = action === "clear" ? await board.clearName(ref) : action === "remove" ? await board.remove(ref) : false;
+      return reply(res, 200, { ok: done });
+    }
+  } catch (err) {
+    console.error("leaderboard:", err.message);
+    return reply(res, 500, { error: "The leaderboard isn't available right now" });
+  }  res.writeHead(200, { "Content-Type": "text/plain", ...CORS });
   res.end("Hurdle Jump relay is running. Rooms open: " + rooms.size + "\n");
 });
+
+// ---------------------------------------------------------------- multiplayer rooms
+
 const wss = new WebSocketServer({ server });
 
 function send(ws, obj) {
@@ -37,8 +356,10 @@ function leave(ws) {
   const room = ws.room ? rooms.get(ws.room) : null;
   if (!room) return;
   room.players.delete(ws.id);
-  if (ws.id === room.host) {
-    // Host left: the race ends for everyone.
+  if (room.players.size === 0) {
+    rooms.delete(ws.room);
+  } else if (ws.id === room.host && !room.public) {
+    // Private race: the host left, so the race ends for everyone.
     for (const p of room.players.values()) {
       send(p.ws, { op: "closed" });
       p.ws.room = null;
@@ -46,6 +367,12 @@ function leave(ws) {
     rooms.delete(ws.room);
   } else {
     for (const p of room.players.values()) send(p.ws, { op: "peer_left", id: ws.id });
+    if (ws.id === room.host) {
+      // Public race: the longest-waiting player takes over as host.
+      room.host = Math.min(...room.players.keys());
+      room.locked = false;
+      for (const p of room.players.values()) send(p.ws, { op: "host", id: room.host });
+    }
   }
   ws.room = null;
 }
@@ -58,7 +385,15 @@ function enter(ws, name, room, info) {
   for (const p of room.players.values()) send(p.ws, { op: "peer_joined", id, info });
   room.players.set(id, { ws, info });
   const players = [...room.players.entries()].map(([pid, p]) => ({ id: pid, info: p.info }));
-  send(ws, { op: "joined", id, host: room.host, room: name, players });
+  send(ws, { op: "joined", id, host: room.host, room: name, public: room.public, players });
+}
+
+function version(m) {
+  return Number.isInteger(m.v) ? m.v : 1;
+}
+
+function newRoom(v, isPublic) {
+  return { host: 1, locked: false, public: isPublic, v, players: new Map() };
 }
 
 wss.on("connection", (ws) => {
@@ -74,7 +409,7 @@ wss.on("connection", (ws) => {
         const name = roomName(m.room);
         if (!name) return send(ws, { op: "error", msg: "Enter a race name" });
         if (rooms.has(name)) return send(ws, { op: "error", msg: "That race name is taken" });
-        const r = { host: 1, locked: false, players: new Map() };
+        const r = newRoom(version(m), false);
         rooms.set(name, r);
         enter(ws, name, r, m.info || {});
         break;
@@ -83,15 +418,37 @@ wss.on("connection", (ws) => {
         leave(ws);
         const name = roomName(m.room);
         const r = rooms.get(name);
-        if (!r) return send(ws, { op: "error", msg: "No race called " + name });
+        if (!r || r.public) return send(ws, { op: "error", msg: "No race called " + name });
+        if (r.v !== version(m)) return send(ws, { op: "error", msg: "That race is on a different version of the game - both players need the latest version" });
         if (r.locked) return send(ws, { op: "error", msg: "That race has already started" });
         if (r.players.size >= MAX_PLAYERS) return send(ws, { op: "error", msg: "That race is full" });
         enter(ws, name, r, m.info || {});
         break;
       }
+      case "quick": {
+        // Public race: the open lobby with the most players waiting (fills races up fastest),
+        // or a brand new one with you as host.
+        leave(ws);
+        const v = version(m);
+        let best = null;
+        for (const [name, r] of rooms) {
+          if (r.public && !r.locked && r.v === v && r.players.size < MAX_PLAYERS &&
+              (!best || r.players.size > best[1].players.size)) best = [name, r];
+        }
+        if (best) return enter(ws, best[0], best[1], m.info || {});
+        let name;
+        do { name = "PUBLIC-" + Math.random().toString(36).slice(2, 6).toUpperCase(); } while (rooms.has(name));
+        const r = newRoom(v, true);
+        rooms.set(name, r);
+        enter(ws, name, r, m.info || {});
+        break;
+      }
       case "send":
         if (!room) return;
-        for (const [pid, p] of room.players) if (pid !== ws.id) send(p.ws, { op: "msg", from: ws.id, data: m.data });
+        {
+          const out = JSON.stringify({ op: "msg", from: ws.id, data: m.data });   // once, not per player
+          for (const [pid, p] of room.players) if (pid !== ws.id && p.ws.readyState === 1) p.ws.send(out);
+        }
         break;
       case "lock":
       case "unlock":

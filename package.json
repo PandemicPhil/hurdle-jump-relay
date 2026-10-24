@@ -1,7 +1,7 @@
 {
   "name": "hurdle-jump-relay",
-  "version": "1.0.0",
-  "description": "Matchmaker/relay for Hurdle Jump multiplayer races",
+  "version": "1.1.0",
+  "description": "Matchmaker/relay for Hurdle Jump multiplayer races, plus the global leaderboard",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,7 @@
     "node": ">=18"
   },
   "dependencies": {
+    "obscenity": "^0.4.3",
     "ws": "^8.18.0"
   }
 }

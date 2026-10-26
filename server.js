@@ -22,6 +22,9 @@
 //   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
 //   POST /leaderboard/report {id, ref}   -> {ok}. Reports never hide anything by themselves (no trolling):
 //                                           they go on a list for the admin to review.
+//   GET  /daily?id=<id>                  -> today's Daily Challenge: {day, seed, ends_in, today: top 3, yesterday,
+//                                           you: {played, score, rank}, badges: {gold, silver, bronze}, total}
+//   POST /daily  {id, num, day, score, secs} -> your one run for the day (the first one counts)
 //   GET  /admin?key=<ADMIN_KEY>          (you only) a page listing reported names and the top 50, with
 //                                           buttons to clear a name, remove an entry or dismiss reports
 // Names: 3-12 letters, numbers and single spaces, checked against a profanity filter (the "obscenity"
@@ -191,6 +194,11 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         }
         return out;
       },
+      async entry(id) { return entryOut(0, id, 0, await this.meta(id)); },
+      async touch(id, num) {
+        const m = await this.meta(id);
+        if (m.num !== num) await this.saveMeta(id, { ...m, num });
+      },
       async view(id) {
         const flat = await redis(["ZREVRANGE", "hj:scores", "0", String(TOP_N - 1), "WITHSCORES"]);
         const ids = [];
@@ -256,6 +264,12 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
           reports.delete(id);
           return true;
         },
+        async entry(id) { return entryOut(0, id, 0, mem.get(id) || {}); },
+        async touch(id, num) {
+          const m = mem.get(id);
+          if (!m) mem.set(id, { score: -1, num });
+          else m.num = num;
+        },
         async view(id) {
           const all = [...mem.entries()].filter(([, m]) => m.score >= 0).sort((a, b) => b[1].score - a[1].score);
           const top = all.slice(0, TOP_N).map(([pid, m], i) => entryOut(i + 1, pid, m.score, m));
@@ -301,8 +315,160 @@ function rateLimited(ip) {
 }
 setInterval(() => posts.clear(), 10 * 60000);
 
-// ---------------------------------------------------------------- admin page
+// ---------------------------------------------------------------- daily challenge
+//
+// One course a day for everyone: the day is the date in US Eastern time (it changes at midnight in
+// New York, daylight saving included) and the course comes from a seed made from that date. Each
+// player gets one run (their first score counts). When a day ends, its top 3 get a crown (1st),
+// silver (2nd) or bronze (3rd) badge, counted per player; 1st place also unlocks the Champion Band
+// wristband in the game. Ties: whoever ran first.
 
+const TZ = "America/New_York";
+const DAY_SCALE = 100000;   // stored value = score * DAY_SCALE + a tie-break (earlier = higher)
+
+function easternParts(date = new Date()) {
+  const f = new Intl.DateTimeFormat("en-CA", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  return Object.fromEntries(f.formatToParts(date).map((p) => [p.type, p.value]));
+}
+// Testing only: DAILY_TEST_DAY_FILE (never set on Render) names a file holding "today", so a test can
+// move to the next day without waiting for midnight.
+const TEST_DAY_FILE = process.env.DAILY_TEST_DAY_FILE || "";
+function easternDay(date) {
+  if (!date && TEST_DAY_FILE) return require("fs").readFileSync(TEST_DAY_FILE, "utf8").trim();
+  const p = easternParts(date || new Date());
+  return `${p.year}-${p.month}-${p.day}`;
+}
+function secondsIntoDay() {
+  const p = easternParts();
+  return (Number(p.hour) % 24) * 3600 + Number(p.minute) * 60 + Number(p.second);
+}
+// Seconds until the Eastern date changes (exact, even on daylight-saving days).
+function secondsToNextDay() {
+  const now = Date.now(), today = easternDay();
+  let lo = 0, hi = 26 * 3600;
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    if (easternDay(new Date(now + mid * 1000)) === today) lo = mid; else hi = mid;
+  }
+  return hi;
+}
+function prevDay(day) {
+  const [y, m, d] = day.split("-").map(Number);
+  return new Date(Date.UTC(y, m - 1, d) - 86400000).toISOString().slice(0, 10);
+}
+function daySeed(day) {
+  return parseInt(crypto.createHash("sha256").update("hj-daily:" + day).digest("hex").slice(0, 8), 16);
+}
+function parseObj(json) {
+  try { return JSON.parse(json || "{}") || {}; } catch { return {}; }
+}
+
+// Tiny storage layer for the daily data: Upstash Redis, or memory (same fallback as the leaderboard).
+const kv = UPSTASH_URL && UPSTASH_TOKEN
+  ? {
+      zaddNX: async (k, s, m) => Number(await redis(["ZADD", k, "NX", String(s), m])),
+      top: async (k, n) => {
+        const f = await redis(["ZREVRANGE", k, "0", String(n - 1), "WITHSCORES"]);
+        const out = [];
+        for (let i = 0; i < f.length; i += 2) out.push([f[i], Number(f[i + 1])]);
+        return out;
+      },
+      rank: (k, m) => redis(["ZREVRANK", k, m]),
+      score: async (k, m) => { const s = await redis(["ZSCORE", k, m]); return s === null ? null : Number(s); },
+      card: async (k) => Number(await redis(["ZCARD", k])),
+      hget: (k, f) => redis(["HGET", k, f]),
+      hset: (k, f, v) => redis(["HSET", k, f, v]),
+      get: (k) => redis(["GET", k]),
+      set: (k, v) => redis(["SET", k, v]),
+      setnx: async (k, v) => (await redis(["SET", k, v, "NX"])) === "OK",
+      expire: (k, s) => redis(["EXPIRE", k, String(s)]),
+    }
+  : (() => {
+      const z = new Map(), h = new Map(), s = new Map();
+      const zset = (k) => { if (!z.has(k)) z.set(k, new Map()); return z.get(k); };
+      const sorted = (k) => [...zset(k).entries()].sort((a, b) => b[1] - a[1]);
+      return {
+        zaddNX: async (k, sc, m) => { const zz = zset(k); if (zz.has(m)) return 0; zz.set(m, sc); return 1; },
+        top: async (k, n) => sorted(k).slice(0, n),
+        rank: async (k, m) => { const i = sorted(k).findIndex(([id]) => id === m); return i < 0 ? null : i; },
+        score: async (k, m) => (zset(k).has(m) ? zset(k).get(m) : null),
+        card: async (k) => zset(k).size,
+        hget: async (k, f) => (h.get(k) || new Map()).get(f) ?? null,
+        hset: async (k, f, v) => { if (!h.has(k)) h.set(k, new Map()); h.get(k).set(f, v); },
+        get: async (k) => s.get(k) ?? null,
+        set: async (k, v) => { s.set(k, v); },
+        setnx: async (k, v) => { if (s.has(k)) return false; s.set(k, v); return true; },
+        expire: async () => {},
+      };
+    })();
+
+// The first request of a new day closes the previous one: badges for its top 3, and its results
+// kept as "yesterday's best".
+async function finalizeDays(today) {
+  const cur = await kv.get("hj:daily:current");
+  if (cur === today) return;
+  if (cur && cur < today && await kv.setnx("hj:daily:final:" + cur, "1")) {
+    await kv.expire("hj:daily:final:" + cur, 7 * 86400);
+    const top = await kv.top("hj:day:" + cur, 3);
+    for (let i = 0; i < top.length; i++) {
+      const b = parseObj(await kv.hget("hj:badges", top[i][0]));
+      const k = ["gold", "silver", "bronze"][i];
+      b[k] = (b[k] || 0) + 1;
+      await kv.hset("hj:badges", top[i][0], JSON.stringify(b));
+    }
+    await kv.set("hj:daily:last", JSON.stringify({ day: cur, top: top.map(([id, v]) => ({ id, score: Math.floor(v / DAY_SCALE) })) }));
+  }
+  if (!cur || cur < today) await kv.set("hj:daily:current", today);
+}
+
+async function placeList(rows) {
+  const out = [];
+  for (let i = 0; i < rows.length; i++) {
+    const e = await board.entry(rows[i].id);
+    const b = parseObj(await kv.hget("hj:badges", rows[i].id));
+    out.push({ rank: i + 1, name: e.name, ref: e.ref, score: rows[i].score, times: b[["gold", "silver", "bronze"][i]] || 0 });
+  }
+  return out;
+}
+
+async function dailyView(id) {
+  const today = easternDay();
+  await finalizeDays(today);
+  const key = "hj:day:" + today;
+  const today3 = await placeList((await kv.top(key, 3)).map(([pid, v]) => ({ id: pid, score: Math.floor(v / DAY_SCALE) })));
+  const last = parseObj(await kv.get("hj:daily:last"));
+  const yesterday = last.day ? { day: last.day, is_yesterday: last.day === prevDay(today), top: await placeList(last.top || []) } : null;
+  let you = { played: false, score: 0, rank: 0 };
+  let badges = { gold: 0, silver: 0, bronze: 0 };
+  if (id) {
+    const v = await kv.score(key, id);
+    if (v !== null) you = { played: true, score: Math.floor(v / DAY_SCALE), rank: Number(await kv.rank(key, id)) + 1 };
+    badges = { ...badges, ...parseObj(await kv.hget("hj:badges", id)) };
+  }
+  return { day: today, seed: daySeed(today), ends_in: secondsToNextDay(), today: today3, yesterday, you, badges, total: await kv.card(key) };
+}
+
+async function dailySubmit(b) {
+  if (!b || !validId(b.id)) return { error: "bad request" };
+  const num = Number(b.num), score = Number(b.score), secs = Number(b.secs);
+  if (!Number.isInteger(num) || num < 1000 || num > 9999) return { error: "bad request" };
+  if (!Number.isInteger(score) || score < 0 || score > 5000 || !(secs >= 0 && secs <= 7200)) return { error: "bad request" };
+  if (score > secs / 0.6 + 3) return { error: "That score doesn't add up" };   // faster than any run can clear hurdles
+  const today = easternDay();
+  let day = String(b.day || "");
+  // A run that started before midnight and ended just after still counts for the day it started.
+  const late = day === prevDay(today) && secondsIntoDay() < 600 && !(await kv.get("hj:daily:final:" + day));
+  if (day !== today && !late) return { error: "That daily challenge has ended", ...(await dailyView(String(b.id))) };
+  await board.touch(String(b.id), num);
+  const tiebreak = DAY_SCALE - 1 - Math.min(DAY_SCALE - 1, late ? 86399 : secondsIntoDay());
+  const added = await kv.zaddNX("hj:day:" + day, score * DAY_SCALE + tiebreak, String(b.id));
+  await kv.expire("hj:day:" + day, 4 * 86400);
+  const view = await dailyView(String(b.id));
+  return added ? { ...view, accepted: true } : { ...view, accepted: false, error: "You've already run today's challenge" };
+}
+
+// ---------------------------------------------------------------- admin page
 function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
@@ -362,6 +528,14 @@ const server = http.createServer(async (req, res) => {
     return res.end();
   }
   try {
+    if (url.pathname === "/daily" && req.method === "GET") {
+      return reply(res, 200, await dailyView(url.searchParams.get("id") || ""));
+    }
+    if (url.pathname === "/daily" && req.method === "POST") {
+      const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",").pop().trim();
+      if (rateLimited(ip)) return reply(res, 429, { error: "Too many tries - wait a minute" });
+      return reply(res, 200, await dailySubmit(await readBody(req)));
+    }
     if (url.pathname === "/leaderboard" && req.method === "GET") {
       return reply(res, 200, await board.view(url.searchParams.get("id") || ""));
     }

@@ -17,8 +17,11 @@
 // LEADERBOARD (plain web requests, so it also works from the browser build). A player's "id" is a
 // private random key their game made; "ref" is a public tag for an entry (a hash of the id) used to
 // report it, so ids are never shown to anyone else.
-//   GET  /leaderboard?id=<id>            -> {top: [{rank, ref, name, score, runner, champ}], you: {rank, score, ref, name} | null, total}
-//   POST /leaderboard        {id, num, score, runner, champ} -> the board (as GET) - your best run
+//   GET  /leaderboard?id=<id>            -> {top: [{rank, ref, name, score, runner, champ, pic, border}], you: {rank, score, ref, name} | null, total}
+//   POST /leaderboard        {id, num, score, runner, champ, pic, border, stats} -> the board (as GET) - your best run,
+//                                           plus your profile (picture, border and stats others can look at)
+//   GET  /leaderboard/profile?ref=<ref>  -> one player's profile: {rank, ref, name, score, runner, champ, pic, border,
+//                                           stats, badges: {gold, silver, bronze}} (tap a picture on the board)
 //   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
 //   POST /leaderboard/report {id, ref}   -> {ok}. Reports never hide anything by themselves (no trolling):
 //                                           they go on a list for the admin to review.
@@ -143,7 +146,15 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       async submit(e) {
         await redis(["ZADD", "hj:scores", "GT", String(e.score), e.id]);
         const m = await this.meta(e.id);
-        await this.saveMeta(e.id, { ...m, num: e.num, runner: e.runner, champ: e.champ });
+        await this.saveMeta(e.id, { ...m, num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats });
+      },
+      // One player by public ref: {id, meta, score, rank} or null.
+      async lookup(ref) {
+        const id = await this.idOf(ref);
+        if (!id) return null;
+        const score = await redis(["ZSCORE", "hj:scores", id]);
+        const rank = await redis(["ZREVRANK", "hj:scores", id]);
+        return { id, meta: await this.meta(id), score: score === null ? 0 : Number(score), rank: rank === null ? 0 : Number(rank) + 1 };
       },
       async setName(id, name) {
         const m = await this.meta(id);
@@ -226,7 +237,14 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       return {
         async submit(e) {
           const old = mem.get(e.id) || { score: -1 };
-          mem.set(e.id, { ...old, score: Math.max(e.score, old.score), num: e.num, runner: e.runner, champ: e.champ });
+          mem.set(e.id, { ...old, score: Math.max(e.score, old.score), num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats });
+        },
+        async lookup(ref) {
+          const id = idOf(ref);
+          if (!id) return null;
+          const m = mem.get(id);
+          const all = [...mem.entries()].filter(([, x]) => x.score >= 0).sort((a, b) => b[1].score - a[1].score);
+          return { id, meta: m, score: Math.max(0, m.score), rank: all.findIndex(([pid]) => pid === id) + 1 };
         },
         async setName(id, name) {
           mem.set(id, { score: -1, ...(mem.get(id) || {}), name });
@@ -288,7 +306,25 @@ function entryOut(rank, id, score, m) {
   const num = Number.isInteger(m.num) ? m.num : 0;
   const custom = typeof m.name === "string" && m.name !== "";
   return { rank, ref: refOf(id), name: custom ? m.name : "Player " + num, custom, score,
-    runner: RUNNERS.includes(m.runner) ? m.runner : "", champ: m.champ === true };
+    runner: RUNNERS.includes(m.runner) ? m.runner : "", champ: m.champ === true,
+    pic: Number.isInteger(m.pic) ? m.pic : 0, border: Number.isInteger(m.border) ? m.border : 0 };
+}
+
+// Profile stats a player shares (whole numbers only; anything else is dropped).
+const STAT_KEYS = ["best", "total", "race_wins", "circuit_on", "circuit", "champs", "mp_wins", "mp_races", "crashes", "birds", "gophers"];
+function cleanStats(s) {
+  const out = {};
+  if (!s || typeof s !== "object") return out;
+  for (const k of STAT_KEYS) {
+    const v = Number(s[k]);
+    if (Number.isInteger(v) && v >= 0 && v <= 10000000) out[k] = v;
+  }
+  return out;
+}
+
+function smallInt(v) {
+  const n = Number(v);
+  return Number.isInteger(n) && n >= 0 && n < 64 ? n : 0;
 }
 
 function validId(id) {
@@ -301,7 +337,7 @@ function validEntry(b) {
   if (!Number.isInteger(num) || num < 1000 || num > 9999) return null;
   if (!Number.isInteger(score) || score < 0 || score > 5000) return null;
   const runner = RUNNERS.includes(b.runner) ? b.runner : "";
-  return { id: String(b.id), num, score, runner, champ: b.champ === true };
+  return { id: String(b.id), num, score, runner, champ: b.champ === true, pic: smallInt(b.pic), border: smallInt(b.border), stats: cleanStats(b.stats) };
 }
 
 // Each address may send a handful of requests a minute (a run takes far longer than that).
@@ -427,7 +463,7 @@ async function placeList(rows) {
   for (let i = 0; i < rows.length; i++) {
     const e = await board.entry(rows[i].id);
     const b = parseObj(await kv.hget("hj:badges", rows[i].id));
-    out.push({ rank: i + 1, name: e.name, ref: e.ref, score: rows[i].score, times: b[["gold", "silver", "bronze"][i]] || 0 });
+    out.push({ rank: i + 1, name: e.name, ref: e.ref, pic: e.pic, border: e.border, score: rows[i].score, times: b[["gold", "silver", "bronze"][i]] || 0 });
   }
   return out;
 }
@@ -535,6 +571,13 @@ const server = http.createServer(async (req, res) => {
       const ip = String(req.headers["x-forwarded-for"] || req.socket.remoteAddress || "").split(",").pop().trim();
       if (rateLimited(ip)) return reply(res, 429, { error: "Too many tries - wait a minute" });
       return reply(res, 200, await dailySubmit(await readBody(req)));
+    }
+    if (url.pathname === "/leaderboard/profile" && req.method === "GET") {
+      const ref = String(url.searchParams.get("ref") || "");
+      const p = /^[0-9a-f]{12}$/.test(ref) ? await board.lookup(ref) : null;
+      if (!p) return reply(res, 200, { error: "That player isn't on the board any more" });
+      const badges = { gold: 0, silver: 0, bronze: 0, ...parseObj(await kv.hget("hj:badges", p.id)) };
+      return reply(res, 200, { ...entryOut(p.rank, p.id, p.score, p.meta), stats: cleanStats(p.meta.stats), badges });
     }
     if (url.pathname === "/leaderboard" && req.method === "GET") {
       return reply(res, 200, await board.view(url.searchParams.get("id") || ""));

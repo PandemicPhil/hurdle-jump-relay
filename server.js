@@ -23,6 +23,8 @@
 //   GET  /leaderboard/profile?ref=<ref>  -> one player's profile: {rank, ref, name, score, runner, champ, pic, border,
 //                                           stats, badges: {gold, silver, bronze}} (tap a picture on the board)
 //   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
+//   POST /leaderboard/delete {id}        -> {ok}: deletes everything the server keeps about that player (entry,
+//                                           name, profile, stats, daily runs and medals, reports) - "Delete my data"
 //   POST /leaderboard/report {id, ref}   -> {ok}. Reports never hide anything by themselves (no trolling):
 //                                           they go on a list for the admin to review.
 //   GET  /daily?id=<id>                  -> today's Daily Challenge: {day, seed, ends_in, today: top 3, yesterday,
@@ -197,6 +199,15 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         await this.clearReports(id);
         return true;
       },
+      // Delete my data: everything about this player.
+      async forget(id) {
+        const m = await this.meta(id);
+        if (m.name) await this.releaseName(id, m.name);
+        await redis(["ZREM", "hj:scores", id]);
+        await redis(["HDEL", "hj:meta", id]);
+        await redis(["HDEL", "hj:refs", refOf(id)]);
+        await this.clearReports(id);
+      },
       async remove(ref) {
         const id = await this.idOf(ref);
         if (!id) return false;
@@ -295,6 +306,11 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
           mem.get(id).name = "";
           reports.delete(id);
           return true;
+        },
+        async forget(id) {
+          release(id);
+          mem.delete(id);
+          reports.delete(id);
         },
         async remove(ref) {
           const id = idOf(ref);
@@ -446,6 +462,8 @@ const kv = UPSTASH_URL && UPSTASH_TOKEN
       set: (k, v) => redis(["SET", k, v]),
       setnx: async (k, v) => (await redis(["SET", k, v, "NX"])) === "OK",
       expire: (k, s) => redis(["EXPIRE", k, String(s)]),
+      zrem: (k, m) => redis(["ZREM", k, m]),
+      hdel: (k, f) => redis(["HDEL", k, f]),
     }
   : (() => {
       const z = new Map(), h = new Map(), s = new Map();
@@ -463,6 +481,8 @@ const kv = UPSTASH_URL && UPSTASH_TOKEN
         set: async (k, v) => { s.set(k, v); },
         setnx: async (k, v) => { if (s.has(k)) return false; s.set(k, v); return true; },
         expire: async () => {},
+        zrem: async (k, m) => { zset(k).delete(m); },
+        hdel: async (k, f) => { (h.get(k) || new Map()).delete(f); },
       };
     })();
 
@@ -493,6 +513,23 @@ async function placeList(rows) {
     out.push({ rank: i + 1, name: e.name, ref: e.ref, pic: e.pic, border: e.border, score: rows[i].score, times: b[["gold", "silver", "bronze"][i]] || 0 });
   }
   return out;
+}
+
+// Delete my data: the player's daily runs (today and the last few days), medals and their place in
+// "yesterday's best".
+async function forgetDaily(id) {
+  const today = easternDay();
+  let day = today;
+  for (let i = 0; i < 5; i++) {
+    await kv.zrem("hj:day:" + day, id);
+    day = prevDay(day);
+  }
+  await kv.hdel("hj:badges", id);
+  const last = parseObj(await kv.get("hj:daily:last"));
+  if (Array.isArray(last.top) && last.top.some((e) => e.id === id)) {
+    last.top = last.top.filter((e) => e.id !== id);
+    await kv.set("hj:daily:last", JSON.stringify(last));
+  }
 }
 
 async function dailyView(id) {
@@ -628,6 +665,12 @@ const server = http.createServer(async (req, res) => {
           return reply(res, 200, { error: name.length < 12 ? "Someone already has that name - try " + name + "1" : "Someone already has that name" });
         }
         return reply(res, 200, await board.view(String(b.id)));
+      }
+      if (url.pathname === "/leaderboard/delete") {
+        if (!b || !validId(b.id)) return reply(res, 400, { error: "bad request" });
+        await board.forget(String(b.id));
+        await forgetDaily(String(b.id));
+        return reply(res, 200, { ok: true });
       }
       if (url.pathname === "/leaderboard/report") {
         if (!b || !validId(b.id) || !/^[0-9a-f]{12}$/.test(String(b.ref || ""))) return reply(res, 400, { error: "bad request" });

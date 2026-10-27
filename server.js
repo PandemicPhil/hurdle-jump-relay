@@ -30,7 +30,7 @@
 //   POST /daily  {id, num, day, score, secs} -> your one run for the day (the first one counts)
 //   GET  /admin?key=<ADMIN_KEY>          (you only) a page listing reported names and the top 50, with
 //                                           buttons to clear a name, remove an entry or dismiss reports
-// Names: 3-12 letters, numbers and single spaces, checked against a profanity filter (the "obscenity"
+// Names: unique (ignoring capitals), 3-12 letters, numbers and single spaces, checked against a profanity filter (the "obscenity"
 // package) and a reserved list. No name = "Player <number>".
 // Storage: an Upstash Redis database when UPSTASH_REDIS_REST_URL and UPSTASH_REDIS_REST_TOKEN are set
 // (see MULTIPLAYER_SETUP.md); otherwise memory only, which is wiped whenever the server restarts.
@@ -147,6 +147,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         await redis(["ZADD", "hj:scores", "GT", String(e.score), e.id]);
         const m = await this.meta(e.id);
         await this.saveMeta(e.id, { ...m, num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats });
+        if (m.name) await redis(["HSETNX", "hj:names", nameKey(m.name), e.id]);   // names from before they were unique
       },
       // One player by public ref: {id, meta, score, rank} or null.
       async lookup(ref) {
@@ -156,10 +157,19 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         const rank = await redis(["ZREVRANK", "hj:scores", id]);
         return { id, meta: await this.meta(id), score: score === null ? 0 : Number(score), rank: rank === null ? 0 : Number(rank) + 1 };
       },
+      // Names are unique (ignoring capitals): hj:names = name key -> id. False if someone else has it.
       async setName(id, name) {
+        const key = nameKey(name);
+        await redis(["HSETNX", "hj:names", key, id]);
+        if ((await redis(["HGET", "hj:names", key])) !== id) return false;
         const m = await this.meta(id);
+        if (m.name && nameKey(m.name) !== key) await this.releaseName(id, m.name);
         await this.saveMeta(id, { ...m, name });
         await this.clearReports(id);   // a new name starts with no reports
+        return true;
+      },
+      async releaseName(id, name) {
+        if ((await redis(["HGET", "hj:names", nameKey(name)])) === id) await redis(["HDEL", "hj:names", nameKey(name)]);
       },
       async report(reporter, ref) {
         const target = await this.idOf(ref);
@@ -182,6 +192,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         const id = await this.idOf(ref);
         if (!id) return false;
         const m = await this.meta(id);
+        if (m.name) await this.releaseName(id, m.name);
         await this.saveMeta(id, { ...m, name: "" });
         await this.clearReports(id);
         return true;
@@ -189,6 +200,8 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       async remove(ref) {
         const id = await this.idOf(ref);
         if (!id) return false;
+        const m = await this.meta(id);
+        if (m.name) await this.releaseName(id, m.name);
         await redis(["ZREM", "hj:scores", id]);
         await redis(["HDEL", "hj:meta", id]);
         await this.clearReports(id);
@@ -234,6 +247,8 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       const mem = new Map();     // id -> {score (-1 = no run yet), num, runner, champ, name}
       const reports = new Map(); // id -> Set(reporters)
       const idOf = (ref) => [...mem.keys()].find((id) => refOf(id) === ref);
+      const names = new Map();   // name key -> id (names are unique, ignoring capitals)
+      const release = (id) => { const n = (mem.get(id) || {}).name; if (n && names.get(nameKey(n)) === id) names.delete(nameKey(n)); };
       return {
         async submit(e) {
           const old = mem.get(e.id) || { score: -1 };
@@ -247,8 +262,13 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
           return { id, meta: m, score: Math.max(0, m.score), rank: all.findIndex(([pid]) => pid === id) + 1 };
         },
         async setName(id, name) {
+          const owner = names.get(nameKey(name));
+          if (owner && owner !== id) return false;
+          release(id);
+          names.set(nameKey(name), id);
           mem.set(id, { score: -1, ...(mem.get(id) || {}), name });
           reports.delete(id);
+          return true;
         },
         async report(reporter, ref) {
           const target = idOf(ref);
@@ -271,6 +291,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         async clearName(ref) {
           const id = idOf(ref);
           if (!id) return false;
+          release(id);
           mem.get(id).name = "";
           reports.delete(id);
           return true;
@@ -278,6 +299,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         async remove(ref) {
           const id = idOf(ref);
           if (!id) return false;
+          release(id);
           mem.delete(id);
           reports.delete(id);
           return true;
@@ -325,6 +347,11 @@ function cleanStats(s) {
 function smallInt(v) {
   const n = Number(v);
   return Number.isInteger(n) && n >= 0 && n < 64 ? n : 0;
+}
+
+// Two names count as the same if they only differ in capitals or spacing ("Phil" = "phil").
+function nameKey(name) {
+  return String(name).toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 function validId(id) {
@@ -597,7 +624,9 @@ const server = http.createServer(async (req, res) => {
         if (!b || !validId(b.id)) return reply(res, 400, { error: "bad request" });
         const [name, why] = checkName(b.name);
         if (!name) return reply(res, 200, { error: why });
-        await board.setName(String(b.id), name);
+        if (!(await board.setName(String(b.id), name))) {
+          return reply(res, 200, { error: name.length < 12 ? "Someone already has that name - try " + name + "1" : "Someone already has that name" });
+        }
         return reply(res, 200, await board.view(String(b.id)));
       }
       if (url.pathname === "/leaderboard/report") {

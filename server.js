@@ -349,7 +349,7 @@ function entryOut(rank, id, score, m) {
 }
 
 // Profile stats a player shares (whole numbers only; anything else is dropped).
-const STAT_KEYS = ["best", "total", "race_wins", "circuit_on", "circuit", "champs", "mp_wins", "mp_races", "crashes", "birds", "gophers"];
+const STAT_KEYS = ["best", "total", "race_wins", "circuit_on", "circuit", "champs", "mp_wins", "mp_races", "crashes", "birds", "gophers", "whacked"];
 function cleanStats(s) {
   const out = {};
   if (!s || typeof s !== "object") return out;

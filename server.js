@@ -18,8 +18,9 @@
 // private random key their game made; "ref" is a public tag for an entry (a hash of the id) used to
 // report it, so ids are never shown to anyone else.
 //   GET  /leaderboard?id=<id>            -> {top: [{rank, ref, name, score, runner, champ, pic, border}], you: {rank, score, ref, name} | null, total}
-//   POST /leaderboard        {id, num, score, runner, champ, pic, border, stats} -> the board (as GET) - your best run,
-//                                           plus your profile (picture, border and stats others can look at)
+//   POST /leaderboard        {id, num, score, secs, runner, champ, pic, border, stats} -> the board (as GET) - your best
+//                                           run (secs = how long it lasted, checked against the score), plus your
+//                                           profile (picture, border and stats others can look at)
 //   GET  /leaderboard/profile?ref=<ref>  -> one player's profile: {rank, ref, name, score, runner, champ, pic, border,
 //                                           stats, badges: {gold, silver, bronze}} (tap a picture on the board)
 //   POST /leaderboard/name   {id, name}  -> the board, or {error} if the name isn't allowed
@@ -108,8 +109,25 @@ function checkName(raw) {
 
 // ---------------------------------------------------------------- leaderboard storage
 
-const RUNNERS = ["Tim", "Jim", "Jen", "Lyn"];
+const RUNNERS = ["Tim", "Jim", "Jen", "Lyn", "Coach"];
 const TOP_N = 50;
+// Anti-cheat sanity checks (a determined cheater can still fake a run - these stop the obvious ones):
+// - no run (Training best or daily) above MAX_RUN hurdles;
+// - no run that clears hurdles faster than the game ever spaces them (MIN_SECS_PER_HURDLE each);
+// - new bests from FLAG_SCORE up, or sent without the run's length (older saves), go on the admin
+//   page's "Flagged scores" list to look at.
+const MAX_RUN = 1500;
+const MIN_SECS_PER_HURDLE = 0.6;
+const FLAG_SCORE = Number(process.env.FLAG_SCORE) || 400;
+function plausible(score, secs) {
+  return score <= secs / MIN_SECS_PER_HURDLE + 3;
+}
+// Why a new best should be looked at, or "" if it looks normal.
+function flagReason(score, secs) {
+  if (score >= FLAG_SCORE) return "very high score";
+  if (secs === null && score >= 50) return "no run time (older save)";
+  return "";
+}
 const ADMIN_KEY = process.env.ADMIN_KEY || "";
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
@@ -146,10 +164,37 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       },
       async idOf(ref) { return await redis(["HGET", "hj:refs", ref]); },
       async submit(e) {
+        const old = await redis(["ZSCORE", "hj:scores", e.id]);
         await redis(["ZADD", "hj:scores", "GT", String(e.score), e.id]);
         const m = await this.meta(e.id);
-        await this.saveMeta(e.id, { ...m, num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats });
+        const next = { ...m, num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats };
+        if (old === null || e.score > Number(old)) {
+          // A new best: keep how long it took, and put it on the admin's list if it looks unusual.
+          next.secs = e.secs;
+          next.flag = flagReason(e.score, e.secs);
+          if (next.flag) await redis(["ZADD", "hj:flagged", String(e.score), e.id]);
+          else await redis(["ZREM", "hj:flagged", e.id]);
+        }
+        await this.saveMeta(e.id, next);
         if (m.name) await redis(["HSETNX", "hj:names", nameKey(m.name), e.id]);   // names from before they were unique
+      },
+      // The admin's "Flagged scores" list, highest first.
+      async flagged() {
+        const flat = await redis(["ZREVRANGE", "hj:flagged", "0", "49", "WITHSCORES"]);
+        const out = [];
+        for (let i = 0; i < flat.length; i += 2) {
+          const m = await this.meta(flat[i]);
+          out.push({ ...entryOut(0, flat[i], Number(flat[i + 1]), m), secs: m.secs ?? null, flag: m.flag || "" });
+        }
+        return out;
+      },
+      // "Looks fine": off the list (until their next unusual best).
+      async unflag(ref) {
+        const id = await this.idOf(ref);
+        if (!id) return false;
+        await redis(["ZREM", "hj:flagged", id]);
+        await this.saveMeta(id, { ...(await this.meta(id)), flag: "" });
+        return true;
       },
       // One player by public ref: {id, meta, score, rank} or null.
       async lookup(ref) {
@@ -204,6 +249,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         const m = await this.meta(id);
         if (m.name) await this.releaseName(id, m.name);
         await redis(["ZREM", "hj:scores", id]);
+        await redis(["ZREM", "hj:flagged", id]);
         await redis(["HDEL", "hj:meta", id]);
         await redis(["HDEL", "hj:refs", refOf(id)]);
         await this.clearReports(id);
@@ -214,6 +260,7 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
         const m = await this.meta(id);
         if (m.name) await this.releaseName(id, m.name);
         await redis(["ZREM", "hj:scores", id]);
+        await redis(["ZREM", "hj:flagged", id]);
         await redis(["HDEL", "hj:meta", id]);
         await this.clearReports(id);
         return true;
@@ -263,7 +310,22 @@ const board = UPSTASH_URL && UPSTASH_TOKEN
       return {
         async submit(e) {
           const old = mem.get(e.id) || { score: -1 };
-          mem.set(e.id, { ...old, score: Math.max(e.score, old.score), num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats });
+          const next = { ...old, score: Math.max(e.score, old.score), num: e.num, runner: e.runner, champ: e.champ, pic: e.pic, border: e.border, stats: e.stats };
+          if (e.score > old.score) {   // a new best (see the Upstash version)
+            next.secs = e.secs;
+            next.flag = flagReason(e.score, e.secs);
+          }
+          mem.set(e.id, next);
+        },
+        async flagged() {
+          return [...mem.entries()].filter(([, m]) => m.flag && m.score >= 0).sort((a, b) => b[1].score - a[1].score)
+            .slice(0, 50).map(([id, m]) => ({ ...entryOut(0, id, m.score, m), secs: m.secs ?? null, flag: m.flag }));
+        },
+        async unflag(ref) {
+          const id = idOf(ref);
+          if (!id) return false;
+          mem.get(id).flag = "";
+          return true;
         },
         async lookup(ref) {
           const id = idOf(ref);
@@ -378,9 +440,15 @@ function validEntry(b) {
   if (!b || typeof b !== "object" || !validId(b.id)) return null;
   const num = Number(b.num), score = Number(b.score);
   if (!Number.isInteger(num) || num < 1000 || num > 9999) return null;
-  if (!Number.isInteger(score) || score < 0 || score > 5000) return null;
+  if (!Number.isInteger(score) || score < 0 || score > MAX_RUN) return null;
+  // How long the run lasted (newer games send it; older saves don't know it).
+  let secs = null;
+  if (b.secs !== undefined) {
+    secs = Number(b.secs);
+    if (!(secs >= 0 && secs <= 7200)) return null;
+  }
   const runner = RUNNERS.includes(b.runner) ? b.runner : "";
-  return { id: String(b.id), num, score, runner, champ: b.champ === true, pic: smallInt(b.pic), border: smallInt(b.border), stats: cleanStats(b.stats) };
+  return { id: String(b.id), num, score, secs, runner, champ: b.champ === true, pic: smallInt(b.pic), border: smallInt(b.border), stats: cleanStats(b.stats) };
 }
 
 // Each address may send a handful of requests a minute (a run takes far longer than that).
@@ -399,8 +467,8 @@ setInterval(() => posts.clear(), 10 * 60000);
 // One course a day for everyone: the day is the date in US Eastern time (it changes at midnight in
 // New York, daylight saving included) and the course comes from a seed made from that date. Each
 // player gets one run (their first score counts). When a day ends, its top 3 get a crown (1st),
-// silver (2nd) or bronze (3rd) badge, counted per player; 1st place also unlocks the Champion Band
-// wristband in the game. Ties: whoever ran first.
+// silver (2nd) or bronze (3rd) badge, counted per player; 1st place is the gold medal badge on the
+// player's profile picture (a crown after 5). Ties: whoever ran first.
 
 const TZ = "America/New_York";
 const DAY_SCALE = 100000;   // stored value = score * DAY_SCALE + a tie-break (earlier = higher)
@@ -553,8 +621,8 @@ async function dailySubmit(b) {
   if (!b || !validId(b.id)) return { error: "bad request" };
   const num = Number(b.num), score = Number(b.score), secs = Number(b.secs);
   if (!Number.isInteger(num) || num < 1000 || num > 9999) return { error: "bad request" };
-  if (!Number.isInteger(score) || score < 0 || score > 5000 || !(secs >= 0 && secs <= 7200)) return { error: "bad request" };
-  if (score > secs / 0.6 + 3) return { error: "That score doesn't add up" };   // faster than any run can clear hurdles
+  if (!Number.isInteger(score) || score < 0 || score > MAX_RUN || !(secs >= 0 && secs <= 7200)) return { error: "bad request" };
+  if (!plausible(score, secs)) return { error: "That score doesn't add up" };   // faster than any run can clear hurdles
   const today = easternDay();
   let day = String(b.day || "");
   // A run that started before midnight and ended just after still counts for the day it started.
@@ -573,7 +641,7 @@ function esc(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function adminPage(key, reported, top, msg) {
+function adminPage(key, reported, top, msg, flagged) {
   const link = (action, ref, label, confirmText) =>
     `<a class="b ${action}" href="/admin?key=${encodeURIComponent(key)}&action=${action}&ref=${ref}"` +
     (confirmText ? ` onclick="return confirm('${confirmText}')"` : "") + `>${label}</a>`;
@@ -582,7 +650,12 @@ function adminPage(key, reported, top, msg) {
     (e.custom ? link("clear", e.ref, "Clear name") : "") +
     link("remove", e.ref, "Remove entry", "Delete this entry and its score?") +
     (withReports ? link("dismiss", e.ref, "Dismiss reports") : "") + `</td></tr>`;
-  const notes = { clear: "Name cleared.", remove: "Entry removed.", dismiss: "Reports dismissed.", "not-found": "That entry no longer exists." };
+  const notes = { clear: "Name cleared.", remove: "Entry removed.", dismiss: "Reports dismissed.", ok: "Marked as fine.", "not-found": "That entry no longer exists." };
+  // A flagged best: how long the run took and hurdles per second, with remove / looks fine.
+  const time = (s) => s === null ? "<i>unknown</i>" : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, "0")}`;
+  const flagRow = (e) => `<tr><td>${esc(e.name)}</td><td>${e.score}</td><td>${time(e.secs)}</td>` +
+    `<td>${e.secs ? (e.score / e.secs).toFixed(2) : "-"}</td><td>${esc(e.flag)}</td><td class="acts">` +
+    link("remove", e.ref, "Remove entry", "Delete this entry and its score?") + link("ok", e.ref, "Looks fine") + `</td></tr>`;
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Hurdle Jump admin</title><style>
 body{font-family:system-ui,sans-serif;margin:16px;background:#1e2a44;color:#fff}h1{color:#ffd23a;font-size:22px}
@@ -591,11 +664,14 @@ h2{font-size:17px;margin-top:22px;color:#bfe3ff}table{border-collapse:collapse;w
 .clear{background:#3a86f0}.remove{background:#e8403a}.dismiss{background:#5a6070}.msg{background:#4cc94c;padding:8px 12px;border-radius:8px;display:inline-block}
 i{color:#9aa4b8}</style></head><body><h1>Hurdle Jump leaderboard admin</h1>
 ${msg ? `<p class="msg">${esc(notes[msg] || msg)}</p>` : ""}
+<h2>Flagged scores (${flagged.length})</h2>
+${flagged.length ? `<table><tr><th>Name</th><th>Best</th><th>Run time</th><th>Hurdles/sec</th><th>Why</th><th></th></tr>${flagged.map(flagRow).join("")}</table>` : "<p>Nothing flagged.</p>"}
 <h2>Reported names (${reported.length})</h2>
 ${reported.length ? `<table><tr><th>Name</th><th>Reports</th><th>Best</th><th></th></tr>${reported.map((e) => row(e, true)).join("")}</table>` : "<p>Nothing reported.</p>"}
 <h2>Top ${top.length}</h2>
 ${top.length ? `<table><tr><th>Name</th><th>Rank</th><th>Best</th><th></th></tr>${top.map((e) => row(e, false)).join("")}</table>` : "<p>No scores yet.</p>"}
-<p><i>Clear name = back to "Player ####". Remove entry = deletes the score (e.g. a faked one). Dismiss reports = the name is fine.</i></p>
+<p><i>Clear name = back to "Player ####". Remove entry = deletes the score (e.g. a faked one). Dismiss reports = the name is fine.
+Looks fine = takes a flagged score off the list. Real runs clear about 1 hurdle a second; much more than that is a faked run.</i></p>
 </body></html>`;
 }
 
@@ -654,6 +730,7 @@ const server = http.createServer(async (req, res) => {
       if (url.pathname === "/leaderboard") {
         const e = validEntry(b);
         if (!e) return reply(res, 400, { error: "bad entry" });
+        if (e.secs !== null && !plausible(e.score, e.secs)) return reply(res, 400, { error: "That score doesn't add up" });
         await board.submit(e);
         return reply(res, 200, await board.view(e.id));
       }
@@ -689,12 +766,13 @@ const server = http.createServer(async (req, res) => {
         const ref = String(url.searchParams.get("ref") || "");
         const done = action === "clear" ? await board.clearName(ref)
           : action === "remove" ? await board.remove(ref)
-          : action === "dismiss" ? await board.dismiss(ref) : false;
+          : action === "dismiss" ? await board.dismiss(ref)
+          : action === "ok" ? await board.unflag(ref) : false;
         res.writeHead(303, { Location: "/admin?key=" + encodeURIComponent(key) + "&msg=" + (done ? action : "not-found") });
         return res.end();
       }
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(adminPage(key, await board.reported(), (await board.view("")).top, url.searchParams.get("msg") || ""));
+      return res.end(adminPage(key, await board.reported(), (await board.view("")).top, url.searchParams.get("msg") || "", await board.flagged()));
     }  } catch (err) {
     console.error("leaderboard:", err.message);
     return reply(res, 500, { error: "The leaderboard isn't available right now" });
